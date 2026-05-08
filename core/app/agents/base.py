@@ -1,50 +1,77 @@
 from typing import List, Dict, Any, Optional, AsyncIterator
 from pydantic import BaseModel
 import json
+from .tools import ToolRegistry
 
 class AgentState(BaseModel):
     messages: List[Dict[str, str]] = []
     plan: List[str] = []
     context: Dict[str, Any] = {}
     completed: bool = False
+    iteration_count: int = 0
+    max_iterations: int = 10
 
 class BaseAgent:
-    def __init__(self, provider, model: str):
+    def __init__(self, provider, model: str, tools: Optional[ToolRegistry] = None):
         self.provider = provider
         self.model = model
+        self.tools = tools
 
     async def run_stream(self, prompt: str) -> AsyncIterator[Dict[str, Any]]:
-        state = AgentState(messages=[{"role": "user", "content": prompt}])
+        state = AgentState(messages=[
+            {"role": "system", "content": "You are a production-grade AI agent. Use tools to accomplish your task. Think, plan, act, observe, and reflect. If you fail, analyze and replan."},
+            {"role": "user", "content": prompt}
+        ])
 
-        # 1. Planning Phase
-        yield {"type": "status", "content": "Planning task..."}
-        plan_prompt = f"Develop a step-by-step plan for the following task: {prompt}. Return as a JSON list of strings."
-        plan_response = await self.provider.generate(
-            messages=[{"role": "system", "content": "You are a planning assistant. Output ONLY a JSON list."},
-                      {"role": "user", "content": plan_prompt}],
-            model=self.model,
-            response_format={ "type": "json_object" }
-        )
+        while not state.completed and state.iteration_count < state.max_iterations:
+            state.iteration_count += 1
+            yield {"type": "status", "content": f"Iteration {state.iteration_count}: Thinking..."}
 
-        try:
-            # Simple heuristic to extract list
-            content = plan_response['choices'][0]['message']['content']
-            state.plan = json.loads(content).get("plan", [])
-        except:
-            state.plan = [prompt]
+            # 1. Reasoning & Action Step
+            openai_tools = self.tools.get_openai_tools() if self.tools else None
 
-        yield {"type": "plan", "content": state.plan}
+            response = await self.provider.generate(
+                messages=state.messages,
+                model=self.model,
+                tools=openai_tools,
+                tool_choice="auto" if openai_tools else None
+            )
 
-        # 2. Execution Phase (ReAct Loop)
-        for step in state.plan:
-            yield {"type": "status", "content": f"Executing: {step}"}
+            message = response['choices'][0]['message']
+            state.messages.append(message)
 
-            async for chunk in self.provider.generate_stream(
-                messages=state.messages + [{"role": "system", "content": f"Now execute this step: {step}"}],
-                model=self.model
-            ):
-                yield {"type": "token", "content": chunk}
+            if message.get("content"):
+                yield {"type": "token", "content": message["content"]}
 
-            # In a real loop, we'd append assistant response to state.messages
+            # 2. Tool Execution Step
+            if message.get("tool_calls"):
+                for tool_call in message["tool_calls"]:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = json.loads(tool_call["function"]["arguments"])
 
-        yield {"type": "done", "content": "Task completed successfully."}
+                    yield {"type": "status", "content": f"Calling tool: {tool_name}"}
+
+                    tool = self.tools.get_tool(tool_name)
+                    if tool:
+                        result = await tool.execute(**tool_args)
+                        # Observation
+                        state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "content": json.dumps(result)
+                        })
+                        yield {"type": "observation", "tool": tool_name, "content": result}
+                    else:
+                        error_msg = f"Tool {tool_name} not found"
+                        state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "content": error_msg
+                        })
+            else:
+                # No more tools called, assume task finished or needing reflection
+                state.completed = True
+
+        yield {"type": "done", "content": "Task completed."}

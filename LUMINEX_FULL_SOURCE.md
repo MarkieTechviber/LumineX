@@ -1,4 +1,4 @@
-# Luminex AI Platform: Full Source Code & Architecture
+# Luminex AI Platform: Full Source Code & Architecture (v2)
 
 ## 1. File Tree
 ```text
@@ -8,21 +8,25 @@ luminex/
 ├── .gitignore                # Repository hygiene
 ├── gateway/                  # Node.js API Gateway
 │   ├── src/
-│   │   └── index.ts          # Gateway Logic & Proxy
+│   │   └── index.ts          # Gateway Logic & WebSocket Proxy
 │   ├── Dockerfile
 │   └── package.json
 ├── core/                     # Python AI Engine
 │   ├── app/
-│   │   ├── main.py           # FastAPI entry point
+│   │   ├── main.py           # FastAPI entry point & Session Mgmt
 │   │   ├── agents/
-│   │   │   └── base.py       # Agent Loop logic
+│   │   │   ├── base.py       # Iterative ReAct Agent Loop
+│   │   │   ├── tools.py      # Tool Abstractions
+│   │   │   ├── core_tools.py # File/Code Tool Implementations
+│   │   │   └── workspace_state.py # Persistent State Tracking
 │   │   ├── providers/
 │   │   │   ├── base.py       # Provider abstraction
 │   │   │   └── unified.py    # LiteLLM implementation
 │   │   └── rag/
 │   │       └── engine.py     # RAG reference logic
 │   ├── tests/
-│   │   └── test_providers.py # Provider tests
+│   │   ├── test_providers.py # Provider tests
+│   │   └── test_agent_loop.py # Agent Loop verification
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── frontend/                 # Next.js Application
@@ -36,7 +40,7 @@ luminex/
 └── sandbox/                  # Sandbox Environment
     ├── manager/
     │   ├── docker_manager.py # Docker SDK wrapper
-    │   └── workspace.py      # Secure Workspace logic
+    │   └── workspace.py      # Secure Workspace logic (Base64 hardened)
     └── runtimes/
         └── Dockerfile.python # Agent runtime image
 ```
@@ -271,89 +275,9 @@ volumes:
   postgres_data:
 ```
 
-### .gitignore
-```text
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-
-# Node.js
-node_modules/
-dist/
-build/
-.npm
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.env
-
-# Next.js
-.next/
-out/
-
-# Docker
-.dockerignore
-
-# OS
-.DS_Store
-Thumbs.db
-```
-
 ---
 
 ## 4. Gateway Layer (Node.js/TypeScript)
-### gateway/package.json
-```json
-{
-  "name": "luminex-gateway",
-  "version": "1.0.0",
-  "description": "Luminex API Gateway",
-  "main": "dist/index.js",
-  "scripts": {
-    "start": "node dist/index.js",
-    "dev": "ts-node-dev src/index.ts",
-    "build": "tsc"
-  },
-  "dependencies": {
-    "@types/ws": "^8.18.1",
-    "axios": "^1.6.0",
-    "cors": "^2.8.5",
-    "dotenv": "^16.3.1",
-    "express": "^4.18.2",
-    "ioredis": "^5.3.2",
-    "socket.io": "^4.7.2",
-    "ws": "^8.20.0",
-    "zod": "^3.22.4"
-  },
-  "devDependencies": {
-    "@types/cors": "^2.8.15",
-    "@types/express": "^4.17.20",
-    "@types/node": "^20.8.9",
-    "ts-node-dev": "^2.0.0",
-    "typescript": "^5.2.2"
-  }
-}
-```
-
 ### gateway/src/index.ts
 ```typescript
 import express from 'express';
@@ -419,50 +343,17 @@ httpServer.listen(PORT, () => {
 });
 ```
 
-### gateway/Dockerfile
-```dockerfile
-FROM node:20-slim
-
-WORKDIR /app
-
-COPY package*.json ./
-RUN npm install
-
-COPY . .
-RUN npm run build
-
-EXPOSE 3001
-
-CMD ["npm", "start"]
-```
-
 ---
 
 ## 5. AI Core Layer (Python)
-### core/requirements.txt
-```text
-fastapi
-uvicorn
-pydantic
-openai
-anthropic
-litellm
-langchain
-langgraph
-sqlalchemy[asyncio]
-asyncpg
-pgvector
-redis
-python-multipart
-python-dotenv
-docker
-```
-
 ### core/app/main.py
 ```python
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from .providers.unified import UnifiedLiteLLMProvider
 from .agents.base import BaseAgent
+from .agents.tools import ToolRegistry
+from .agents.core_tools import WriteFileTool, ReadFileTool, RunCodeTool
+from sandbox.manager.workspace import Workspace
 import json
 
 app = FastAPI(title="Luminex Core API")
@@ -475,6 +366,17 @@ async def health():
 @app.websocket("/ws/agent")
 async def agent_websocket(websocket: WebSocket):
     await websocket.accept()
+
+    # Provision workspace for the session
+    workspace = Workspace()
+    workspace.provision()
+
+    # Initialize tool registry
+    registry = ToolRegistry()
+    registry.register_tool(WriteFileTool(workspace))
+    registry.register_tool(ReadFileTool(workspace))
+    registry.register_tool(RunCodeTool(workspace))
+
     try:
         while True:
             data = await websocket.receive_text()
@@ -483,7 +385,7 @@ async def agent_websocket(websocket: WebSocket):
             prompt = payload.get("prompt")
             model = payload.get("model", "gpt-4o")
 
-            agent = BaseAgent(provider, model)
+            agent = BaseAgent(provider, model, tools=registry)
 
             async for event in agent.run_stream(prompt):
                 await websocket.send_json(event)
@@ -493,6 +395,8 @@ async def agent_websocket(websocket: WebSocket):
     except Exception as e:
         print(f"Error: {e}")
         await websocket.send_json({"type": "error", "content": str(e)})
+    finally:
+        workspace.destroy()
 ```
 
 ### core/app/agents/base.py
@@ -500,80 +404,237 @@ async def agent_websocket(websocket: WebSocket):
 from typing import List, Dict, Any, Optional, AsyncIterator
 from pydantic import BaseModel
 import json
+from .tools import ToolRegistry
 
 class AgentState(BaseModel):
     messages: List[Dict[str, str]] = []
     plan: List[str] = []
     context: Dict[str, Any] = {}
     completed: bool = False
+    iteration_count: int = 0
+    max_iterations: int = 10
 
 class BaseAgent:
-    def __init__(self, provider, model: str):
+    def __init__(self, provider, model: str, tools: Optional[ToolRegistry] = None):
         self.provider = provider
         self.model = model
+        self.tools = tools
 
     async def run_stream(self, prompt: str) -> AsyncIterator[Dict[str, Any]]:
-        state = AgentState(messages=[{"role": "user", "content": prompt}])
+        state = AgentState(messages=[
+            {"role": "system", "content": "You are a production-grade AI agent. Use tools to accomplish your task. Think, plan, act, observe, and reflect. If you fail, analyze and replan."},
+            {"role": "user", "content": prompt}
+        ])
 
-        # 1. Planning Phase
-        yield {"type": "status", "content": "Planning task..."}
-        plan_prompt = f"Develop a step-by-step plan for the following task: {prompt}. Return as a JSON list of strings."
-        plan_response = await self.provider.generate(
-            messages=[{"role": "system", "content": "You are a planning assistant. Output ONLY a JSON list."},
-                      {"role": "user", "content": plan_prompt}],
-            model=self.model,
-            response_format={ "type": "json_object" }
-        )
+        while not state.completed and state.iteration_count < state.max_iterations:
+            state.iteration_count += 1
+            yield {"type": "status", "content": f"Iteration {state.iteration_count}: Thinking..."}
 
-        try:
-            # Simple heuristic to extract list
-            content = plan_response['choices'][0]['message']['content']
-            state.plan = json.loads(content).get("plan", [])
-        except:
-            state.plan = [prompt]
+            # 1. Reasoning & Action Step
+            openai_tools = self.tools.get_openai_tools() if self.tools else None
 
-        yield {"type": "plan", "content": state.plan}
+            response = await self.provider.generate(
+                messages=state.messages,
+                model=self.model,
+                tools=openai_tools,
+                tool_choice="auto" if openai_tools else None
+            )
 
-        # 2. Execution Phase (ReAct Loop)
-        for step in state.plan:
-            yield {"type": "status", "content": f"Executing: {step}"}
+            message = response['choices'][0]['message']
+            state.messages.append(message)
 
-            async for chunk in self.provider.generate_stream(
-                messages=state.messages + [{"role": "system", "content": f"Now execute this step: {step}"}],
-                model=self.model
-            ):
-                yield {"type": "token", "content": chunk}
+            if message.get("content"):
+                yield {"type": "token", "content": message["content"]}
 
-            # In a real loop, we'd append assistant response to state.messages
+            # 2. Tool Execution Step
+            if message.get("tool_calls"):
+                for tool_call in message["tool_calls"]:
+                    tool_name = tool_call["function"]["name"]
+                    tool_args = json.loads(tool_call["function"]["arguments"])
 
-        yield {"type": "done", "content": "Task completed successfully."}
+                    yield {"type": "status", "content": f"Calling tool: {tool_name}"}
+
+                    tool = self.tools.get_tool(tool_name)
+                    if tool:
+                        result = await tool.execute(**tool_args)
+                        # Observation
+                        state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "content": json.dumps(result)
+                        })
+                        yield {"type": "observation", "tool": tool_name, "content": result}
+                    else:
+                        error_msg = f"Tool {tool_name} not found"
+                        state.messages.append({
+                            "role": "tool",
+                            "tool_call_id": tool_call["id"],
+                            "name": tool_name,
+                            "content": error_msg
+                        })
+            else:
+                # No more tools called, assume task finished or needing reflection
+                state.completed = True
+
+        yield {"type": "done", "content": "Task completed."}
 ```
 
-### core/app/providers/base.py
+### core/app/agents/tools.py
 ```python
 from abc import ABC, abstractmethod
-from typing import AsyncIterator, List, Dict, Any, Optional
+from typing import Dict, Any, Type, List
+import json
 
-class ModelProvider(ABC):
+class BaseTool(ABC):
+    @property
     @abstractmethod
-    async def generate_stream(
-        self,
-        messages: List[Dict[str, str]],
-        model: str,
-        temperature: float = 0.7,
-        max_tokens: int = 2048,
-        **kwargs
-    ) -> AsyncIterator[str]:
+    def name(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        pass
+
+    @property
+    @abstractmethod
+    def parameters(self) -> Dict[str, Any]:
         pass
 
     @abstractmethod
-    async def generate(
-        self,
-        messages: List[Dict[str, str]],
-        model: str,
-        **kwargs
-    ) -> Dict[str, Any]:
+    async def execute(self, **kwargs) -> Any:
         pass
+
+    def to_openai_tool(self) -> Dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+class ToolRegistry:
+    def __init__(self):
+        self.tools: Dict[str, BaseTool] = {}
+
+    def register_tool(self, tool: BaseTool):
+        self.tools[tool.name] = tool
+
+    def get_tool(self, name: str) -> BaseTool:
+        return self.tools.get(name)
+
+    def get_openai_tools(self) -> List[Dict[str, Any]]:
+        return [tool.to_openai_tool() for tool in self.tools.values()]
+```
+
+### core/app/agents/core_tools.py
+```python
+import base64
+from typing import Dict, Any
+from .tools import BaseTool
+
+class WriteFileTool(BaseTool):
+    name = "write_file"
+    description = "Writes content to a file in the workspace"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file"},
+            "content": {"type": "string", "description": "Content to write"}
+        },
+        "required": ["path", "content"]
+    }
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+
+    async def execute(self, path: str, content: str) -> str:
+        try:
+            # We use the workspace's secure method
+            # For simplicity in this tool, we assume workspace handles the transfer
+            # In real implementation, we'd call workspace.write(path, content)
+            encoded_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+            self.workspace.manager.execute_command(
+                self.workspace.container_id,
+                f"bash -c \"echo {encoded_content} | base64 -d > {path}\""
+            )
+            return f"Successfully wrote to {path}"
+        except Exception as e:
+            return f"Error writing file: {str(e)}"
+
+class ReadFileTool(BaseTool):
+    name = "read_file"
+    description = "Reads content from a file in the workspace"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Path to the file"}
+        },
+        "required": ["path"]
+    }
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+
+    async def execute(self, path: str) -> str:
+        try:
+            result = self.workspace.manager.execute_command(
+                self.workspace.container_id,
+                f"cat {path}"
+            )
+            if result['exit_code'] == 0:
+                return result['output']
+            else:
+                return f"Error reading file: {result['output']}"
+        except Exception as e:
+            return f"Error reading file: {str(e)}"
+
+class RunCodeTool(BaseTool):
+    name = "run_code"
+    description = "Executes python code in the sandbox environment"
+    parameters = {
+        "type": "object",
+        "properties": {
+            "code": {"type": "string", "description": "Python code to execute"}
+        },
+        "required": ["code"]
+    }
+
+    def __init__(self, workspace):
+        self.workspace = workspace
+
+    async def execute(self, code: str) -> Dict[str, Any]:
+        return self.workspace.run_code(code)
+```
+
+### core/app/agents/workspace_state.py
+```python
+from typing import Dict, List, Any
+import os
+
+class WorkspaceState:
+    def __init__(self, root_dir: str = "/tmp/luminex_workspace"):
+        self.root_dir = root_dir
+        self.files: Dict[str, str] = {}
+        self.history: List[Dict[str, Any]] = []
+
+    def track_change(self, path: str, content: str, change_type: str = "write"):
+        self.files[path] = content
+        self.history.append({
+            "path": path,
+            "type": change_type,
+            "timestamp": os.times()[4]
+        })
+
+    def get_file_tree(self) -> List[str]:
+        return list(self.files.keys())
+
+    def get_summary(self) -> str:
+        files = self.get_file_tree()
+        return f"Current Workspace: {len(files)} files tracked. Tree: {', '.join(files)}"
 ```
 
 ### core/app/providers/unified.py
@@ -623,278 +684,62 @@ class UnifiedLiteLLMProvider(ModelProvider):
         return response.to_dict()
 ```
 
-### core/app/rag/engine.py
+---
+
+## 6. Sandbox Layer
+### sandbox/manager/workspace.py
 ```python
-from typing import List, Dict, Any
-import sqlalchemy
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker
-import os
+import uuid
+import time
+import base64
+from .docker_manager import SandboxManager
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql+asyncpg://luminex:luminex@db:5432/luminex")
+class Workspace:
+    def __init__(self, workspace_id: str = None):
+        self.id = workspace_id or str(uuid.uuid4())
+        self.manager = SandboxManager()
+        self.container_id = None
 
-class RAGEngine:
-    def __init__(self):
-        self.engine = create_async_engine(DATABASE_URL)
-        self.async_session = sessionmaker(
-            self.engine, expire_on_commit=False, class_=AsyncSession
+    def provision(self):
+        # Use a more capable image if possible, but stick to slim for speed in reference
+        container = self.manager.create_container(
+            image="python:3.11-slim",
+            mem_limit="1g"
+        )
+        self.container_id = container.id
+
+        # Setup workspace directory
+        self.manager.execute_command(self.container_id, "mkdir -p /workspace")
+        return self.container_id
+
+    def run_code(self, code: str):
+        if not self.container_id:
+            raise RuntimeError("Workspace not provisioned")
+
+        encoded_code = base64.b64encode(code.encode('utf-8')).decode('utf-8')
+        filename = f"script_{int(time.time())}.py"
+
+        # Write to /workspace
+        self.manager.execute_command(
+            self.container_id,
+            f"bash -c \"echo {encoded_code} | base64 -d > /workspace/{filename}\""
         )
 
-    async def search(self, query: str, limit: int = 5) -> List[Dict[str, Any]]:
-        # This is a reference implementation for vector search
-        # In a real scenario, we'd use pgvector's <=> operator
-        # SELECT content FROM documents ORDER BY embedding <=> %s LIMIT %s
-        return [
-            {"content": f"Reference context for: {query}", "source": "local_db"}
-        ]
+        # Execute and capture stdout/stderr
+        result = self.manager.execute_command(
+            self.container_id,
+            f"python3 /workspace/{filename}"
+        )
+        return result
 
-    async def ingest(self, content: str, metadata: Dict[str, Any]):
-        # Logic to chunk, embed, and store in pgvector
-        pass
+    def destroy(self):
+        if self.container_id:
+            try:
+                self.manager.cleanup(self.container_id)
+            except:
+                pass
 ```
 
-### core/tests/test_providers.py
-```python
-import pytest
-from app.providers.unified import UnifiedLiteLLMProvider
-
-@pytest.mark.asyncio
-async def test_unified_provider_instantiation():
-    provider = UnifiedLiteLLMProvider()
-    assert provider is not None
-```
-
-### core/Dockerfile
-```dockerfile
-FROM python:3.11-slim
-
-WORKDIR /app
-
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
-COPY . .
-
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
-```
-
----
-
-## 6. Frontend Layer (Next.js/React)
-### frontend/package.json
-```json
-{
-  "name": "luminex-frontend",
-  "version": "0.1.0",
-  "private": true,
-  "scripts": {
-    "dev": "next dev",
-    "build": "next build",
-    "start": "next start",
-    "lint": "next lint"
-  },
-  "dependencies": {
-    "next": "14.0.0",
-    "react": "^18.2.0",
-    "react-dom": "^18.2.0",
-    "lucide-react": "^0.288.0",
-    "socket.io-client": "^4.7.2",
-    "framer-motion": "^10.16.4",
-    "clsx": "^2.0.0",
-    "tailwind-merge": "^1.14.0"
-  },
-  "devDependencies": {
-    "typescript": "^5.2.2",
-    "@types/node": "^20.8.9",
-    "@types/react": "^18.2.33",
-    "@types/react-dom": "^18.2.14",
-    "autoprefixer": "^10.4.16",
-    "postcss": "^8.4.31",
-    "tailwindcss": "^3.3.5"
-  }
-}
-```
-
-### frontend/app/page.tsx
-```tsx
-"use client";
-
-import React, { useState, useEffect, useRef } from 'react';
-import { io, Socket } from 'socket.io-client';
-import { Send, Terminal, Search, Code, Brain, Layout, Activity } from 'lucide-react';
-
-export default function LuminexApp() {
-  const [messages, setMessages] = useState<any[]>([]);
-  const [input, setInput] = useState("");
-  const [mode, setMode] = useState("agent");
-  const [status, setStatus] = useState("Ready");
-  const socketRef = useRef<Socket | null>(null);
-
-  useEffect(() => {
-    socketRef.current = io('http://localhost:3001');
-
-    socketRef.current.on('token', (data) => {
-      setMessages((prev) => {
-        const last = prev[prev.length - 1];
-        if (last && last.role === 'assistant') {
-          return [...prev.slice(0, -1), { ...last, content: last.content + data.content }];
-        }
-        return [...prev, { role: 'assistant', content: data.content }];
-      });
-    });
-
-    socketRef.current.on('status', (data) => {
-      setStatus(data.content);
-    });
-
-    return () => {
-      socketRef.current?.disconnect();
-    };
-  }, []);
-
-  const handleSend = () => {
-    if (!input.trim()) return;
-    setMessages([...messages, { role: 'user', content: input }]);
-    socketRef.current?.emit('message', { prompt: input, mode });
-    setInput("");
-  };
-
-  return (
-    <div className="flex h-screen bg-slate-950 text-slate-100 overflow-hidden font-sans">
-      {/* Sidebar */}
-      <div className="w-16 border-r border-slate-800 flex flex-col items-center py-4 gap-6 bg-slate-900/50">
-        <div className="text-blue-500 font-bold text-xl mb-4">L</div>
-        <ModeIcon icon={<Search size={20} />} active={mode === 'search'} onClick={() => setMode('search')} />
-        <ModeIcon icon={<Code size={20} />} active={mode === 'agent'} onClick={() => setMode('agent')} />
-        <ModeIcon icon={<Layout size={20} />} active={mode === 'builder'} onClick={() => setMode('builder')} />
-        <ModeIcon icon={<Brain size={20} />} active={mode === 'reasoning'} onClick={() => setMode('reasoning')} />
-      </div>
-
-      {/* Main Chat Area */}
-      <div className="flex-1 flex flex-col relative">
-        <header className="h-14 border-b border-slate-800 flex items-center px-6 justify-between bg-slate-950/80 backdrop-blur">
-          <div className="flex items-center gap-2">
-            <span className="font-semibold capitalize">{mode} Mode</span>
-            <span className="text-xs px-2 py-0.5 rounded-full bg-blue-500/10 text-blue-400 border border-blue-500/20">{status}</span>
-          </div>
-          <Activity size={18} className="text-slate-500" />
-        </header>
-
-        <div className="flex-1 overflow-y-auto p-6 space-y-4">
-          {messages.map((msg, i) => (
-            <div key={i} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-              <div className={`max-w-[80%] p-4 rounded-2xl ${msg.role === 'user' ? 'bg-blue-600' : 'bg-slate-800 border border-slate-700'}`}>
-                <pre className="whitespace-pre-wrap font-sans">{msg.content}</pre>
-              </div>
-            </div>
-          ))}
-        </div>
-
-        <div className="p-4 bg-slate-950">
-          <div className="max-w-4xl mx-auto relative">
-            <input
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-              placeholder={`Ask Luminex anything...`}
-              className="w-full bg-slate-900 border border-slate-700 rounded-xl px-4 py-4 pr-12 focus:outline-none focus:border-blue-500 transition-colors"
-            />
-            <button
-              onClick={handleSend}
-              className="absolute right-3 top-3 p-2 bg-blue-600 rounded-lg hover:bg-blue-500 transition-colors"
-            >
-              <Send size={18} />
-            </button>
-          </div>
-        </div>
-      </div>
-
-      {/* Artifact Panel (Mock) */}
-      <div className="w-96 border-l border-slate-800 bg-slate-900/30 hidden lg:flex flex-col">
-        <div className="h-14 border-b border-slate-800 flex items-center px-4 font-medium">Artifacts & Canvas</div>
-        <div className="flex-1 p-4 flex items-center justify-center text-slate-500 flex-col gap-2">
-          <Layout size={48} className="opacity-20" />
-          <p className="text-sm">No artifacts generated yet</p>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-function ModeIcon({ icon, active, onClick }: { icon: any, active: boolean, onClick: () => void }) {
-  return (
-    <button
-      onClick={onClick}
-      className={`p-3 rounded-xl transition-all ${active ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/20' : 'text-slate-400 hover:bg-slate-800 hover:text-white'}`}
-    >
-      {icon}
-    </button>
-  );
-}
-```
-
-### frontend/app/layout.tsx
-```tsx
-import './globals.css'
-import type { Metadata } from 'next'
-import { Inter } from 'next/font/google'
-
-const inter = Inter({ subsets: ['latin'] })
-
-export const metadata: Metadata = {
-  title: 'Luminex AI',
-  description: 'Production-Grade AI Platform',
-}
-
-export default function RootLayout({
-  children,
-}: {
-  children: React.ReactNode
-}) {
-  return (
-    <html lang="en">
-      <body className={inter.className}>{children}</body>
-    </html>
-  )
-}
-```
-
-### frontend/app/globals.css
-```css
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
-```
-
-### frontend/tailwind.config.js
-```javascript
-/** @type {import('tailwindcss').Config} */
-module.exports = {
-  content: [
-    './pages/**/*.{js,ts,jsx,tsx,mdx}',
-    './components/**/*.{js,ts,jsx,tsx,mdx}',
-    './app/**/*.{js,ts,jsx,tsx,mdx}',
-  ],
-  theme: {
-    extend: {},
-  },
-  plugins: [],
-}
-```
-
-### frontend/postcss.config.js
-```javascript
-module.exports = {
-  plugins: {
-    tailwindcss: {},
-    autoprefixer: {},
-  },
-}
-```
-
----
-
-## 7. Sandbox Layer
 ### sandbox/manager/docker_manager.py
 ```python
 import docker
@@ -943,70 +788,4 @@ class SandboxManager:
         container = self.client.containers.get(container_id)
         container.stop()
         container.remove()
-```
-
-### sandbox/manager/workspace.py
-```python
-import uuid
-import time
-import base64
-from .docker_manager import SandboxManager
-
-class Workspace:
-    def __init__(self, workspace_id: str = None):
-        self.id = workspace_id or str(uuid.uuid4())
-        self.manager = SandboxManager()
-        self.container_id = None
-
-    def provision(self):
-        # In a real environment, we would use a pre-built image
-        container = self.manager.create_container(
-            image="python:3.11-slim",
-            mem_limit="1g"
-        )
-        self.container_id = container.id
-        return self.container_id
-
-    def run_code(self, code: str):
-        if not self.container_id:
-            raise RuntimeError("Workspace not provisioned")
-
-        # Use base64 to safely transfer code and avoid shell injection
-        encoded_code = base64.b64encode(code.encode('utf-8')).decode('utf-8')
-        filename = f"script_{int(time.time())}.py"
-
-        # Write file using base64 decoding inside the container
-        self.manager.execute_command(
-            self.container_id,
-            f"bash -c \"echo {encoded_code} | base64 -d > /tmp/{filename}\""
-        )
-
-        # Execute the script
-        result = self.manager.execute_command(
-            self.container_id,
-            f"python3 /tmp/{filename}"
-        )
-        return result
-
-    def destroy(self):
-        if self.container_id:
-            self.manager.cleanup(self.container_id)
-```
-
-### sandbox/runtimes/Dockerfile.python
-```dockerfile
-# Base image for Luminex Agents
-FROM python:3.11-slim
-
-WORKDIR /workspace
-
-# Install common build tools
-RUN apt-get update && apt-get install -i -y \
-    build-essential \
-    curl \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-# Default command
-CMD ["bash"]
 ```

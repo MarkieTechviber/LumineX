@@ -10,35 +10,40 @@ class Workspace:
         self.container_id = None
 
     def provision(self):
-        # In a real environment, we would use a pre-built image
+        # Use a more capable image if possible, but stick to slim for speed in reference
         container = self.manager.create_container(
             image="python:3.11-slim",
             mem_limit="1g"
         )
         self.container_id = container.id
+
+        # Setup workspace directory
+        self.manager.execute_command(self.container_id, "mkdir -p /workspace")
         return self.container_id
 
     def run_code(self, code: str):
         if not self.container_id:
             raise RuntimeError("Workspace not provisioned")
 
-        # Use base64 to safely transfer code and avoid shell injection
         encoded_code = base64.b64encode(code.encode('utf-8')).decode('utf-8')
         filename = f"script_{int(time.time())}.py"
 
-        # Write file using base64 decoding inside the container
+        # Write to /workspace
         self.manager.execute_command(
             self.container_id,
-            f"bash -c \"echo {encoded_code} | base64 -d > /tmp/{filename}\""
+            f"bash -c \"echo {encoded_code} | base64 -d > /workspace/{filename}\""
         )
 
-        # Execute the script
+        # Execute and capture stdout/stderr
         result = self.manager.execute_command(
             self.container_id,
-            f"python3 /tmp/{filename}"
+            f"python3 /workspace/{filename}"
         )
         return result
 
     def destroy(self):
         if self.container_id:
-            self.manager.cleanup(self.container_id)
+            try:
+                self.manager.cleanup(self.container_id)
+            except:
+                pass
