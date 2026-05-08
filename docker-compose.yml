@@ -1,13 +1,22 @@
 version: '3.8'
 
 services:
+  frontend:
+    build: ./frontend
+    ports:
+      - "3000:3000"
+    environment:
+      - NEXT_PUBLIC_GATEWAY_URL=http://localhost:3001
+    depends_on:
+      - gateway
+
   gateway:
     build: ./gateway
     ports:
       - "3001:3001"
     environment:
       - REDIS_URL=redis://redis:6379
-      - CORE_API_URL=http://core:8000
+      - CORE_WS_URL=ws://core:8000/ws/agent
     depends_on:
       - redis
       - core
