@@ -1,0 +1,15 @@
+fastapi
+uvicorn
+pydantic
+openai
+anthropic
+litellm
+langchain
+langgraph
+sqlalchemy[asyncio]
+asyncpg
+pgvector
+redis
+python-multipart
+python-dotenv
+docker

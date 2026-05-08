@@ -1,0 +1,14 @@
+# Base image for Luminex Agents
+FROM python:3.11-slim
+
+WORKDIR /workspace
+
+# Install common build tools
+RUN apt-get update && apt-get install -i -y \
+    build-essential \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Default command
+CMD ["bash"]
